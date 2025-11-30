@@ -199,7 +199,7 @@ def main():
     
     # Verify proxy connection with retries
     console.print("[bold cyan]Connecting to proxy...[/bold cyan]")
-    max_retries = 5
+    max_retries = 10
     proxy_ok = False
     country = "Unknown"
     
