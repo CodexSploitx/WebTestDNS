@@ -2,6 +2,7 @@ import sys
 import time
 import socket
 import ssl
+import base64
 import requests
 
 import dns.resolver
@@ -34,6 +35,8 @@ class SSLResult(TypedDict):
 
 console = Console()
 
+PROXY_URL = "http://geonode_VYbmhFZgPX-type-residential:77a7ea24-b252-442c-80ae-238b90cbcb15@proxy.geonode.io:9000"
+
 def get_domain_from_url(url: str) -> tuple[str, str]:
     if not url.startswith("http"):
         url = "https://" + url
@@ -61,7 +64,11 @@ def check_dns(domain: str) -> dict[str, list[str]]:
 def check_http(url: str) -> HTTPResult:
     try:
         start_time = time.time()
-        response = requests.get(url, timeout=5)
+        proxies = {
+            "http": PROXY_URL,
+            "https": PROXY_URL
+        }
+        response = requests.get(url, timeout=10, proxies=proxies)
         latency = (time.time() - start_time) * 1000
         return {
             "status_code": response.status_code,
@@ -85,9 +92,45 @@ def check_http(url: str) -> HTTPResult:
 
 def check_ssl(domain: str) -> SSLResult:
     try:
+        # Parse proxy details
+        proxy_parsed = urlparse(PROXY_URL)
+        proxy_host = proxy_parsed.hostname
+        proxy_port = proxy_parsed.port
+        if not proxy_host or not proxy_port:
+             return {
+                "valid": False,
+                "expiry": None,
+                "days_left": None,
+                "issuer": None,
+                "error": "Invalid proxy configuration"
+            }
+
+        proxy_auth = f"{proxy_parsed.username}:{proxy_parsed.password}"
+        auth_header = f"Basic {base64.b64encode(proxy_auth.encode()).decode()}"
+
         context = ssl.create_default_context()
-        with socket.create_connection((domain, 443), timeout=3) as sock:
-            with context.wrap_socket(sock, server_hostname=domain) as ssock:
+        
+        # Connect to proxy
+        s = socket.create_connection((proxy_host, proxy_port), timeout=10)
+        
+        # Send CONNECT request
+        connect_req = f"CONNECT {domain}:443 HTTP/1.1\r\nHost: {domain}:443\r\nProxy-Authorization: {auth_header}\r\n\r\n"
+        s.sendall(connect_req.encode())
+        
+        # Read proxy response
+        response = s.recv(4096).decode()
+        if "200 Connection established" not in response:
+            s.close()
+            return {
+                "valid": False,
+                "expiry": None,
+                "days_left": None,
+                "issuer": None,
+                "error": f"Proxy connection failed: {response.splitlines()[0]}"
+            }
+
+        # Wrap socket with SSL
+        with context.wrap_socket(s, server_hostname=domain) as ssock:
                 cert = ssock.getpeercert()
                 if not cert:
                     return {
@@ -126,6 +169,23 @@ def check_ssl(domain: str) -> SSLResult:
             "error": str(e)
         }
 
+def verify_proxy_connection() -> tuple[bool, str]:
+    """Verify proxy connection and get country location."""
+    try:
+        proxies = {
+            "http": PROXY_URL,
+            "https": PROXY_URL
+        }
+        # Use ipapi.co to get location info
+        response = requests.get("https://ipapi.co/json/", timeout=10, proxies=proxies)
+        if response.status_code == 200:
+            data = cast(dict[str, str], response.json())
+            country = str(data.get('country_name', 'Unknown'))
+            return True, country
+        return False, "Unknown"
+    except Exception:
+        return False, "Unknown"
+
 def main():
     console.clear()
     console.print(Panel.fit("[bold cyan]Web & DNS Verifier[/bold cyan]", border_style="cyan"))
@@ -137,7 +197,25 @@ def main():
     
     domain, url = get_domain_from_url(url_input)
     
-    console.print(f"\n[bold yellow]Analyzing:[/bold yellow] [blue]{url}[/blue] (Domain: {domain})\n")
+    # Verify proxy connection with retries
+    console.print("[bold cyan]Connecting to proxy...[/bold cyan]")
+    max_retries = 5
+    proxy_ok = False
+    country = "Unknown"
+    
+    for attempt in range(1, max_retries + 1):
+        proxy_ok, country = verify_proxy_connection()
+        if proxy_ok:
+            console.print(f"[bold green]✓ Proxy connected successfully![/bold green] Location: [yellow]{country}[/yellow]\n")
+            break
+        else:
+            if attempt < max_retries:
+                console.print(f"[bold yellow]⟳ Retry {attempt}/{max_retries} - Attempting to reconnect...[/bold yellow]")
+                time.sleep(1)  # Wait 1 second before retrying
+            else:
+                console.print(f"[bold red]✗ Proxy connection failed after {max_retries} attempts[/bold red]\n")
+    
+    console.print(f"[bold yellow]Analyzing:[/bold yellow] [blue]{url}[/blue] (Domain: {domain})\n")
 
     with console.status("[bold green]Running checks...[/bold green]", spinner="dots"):
         # Run checks
